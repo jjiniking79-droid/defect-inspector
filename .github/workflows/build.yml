@@ -1,0 +1,38 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 코드 가져오기
+        uses: actions/checkout@v4
+
+      - name: Python 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 필요한 라이브러리 설치
+        run: pip install -r requirements.txt
+
+      - name: EXE 빌드
+        run: >
+          pyinstaller --noconfirm --onefile --windowed
+          --name "DefectInspector"
+          --collect-all sklearn
+          --collect-all skimage
+          --collect-all cv2
+          --hidden-import "PIL._tkinter_finder"
+          app.py
+
+      - name: 빌드 결과물 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: DefectInspector-windows
+          path: dist/DefectInspector.exe
