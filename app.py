@@ -40,7 +40,7 @@ IMAGE_EXTS = (
     ".webp", ".jfif", ".ppm", ".pgm", ".pbm"
 )
 
-THUMB_SIZE = (72, 72)
+THUMB_SIZE = (200, 200)
 
 
 class ImageRow:
@@ -280,7 +280,7 @@ class DefectInspectorApp:
     # ------------------------------------------------------------------
     def _create_row_widgets(self, row: ImageRow):
         line = ttk.Frame(self.rows_frame)
-        line.pack(side="top", fill="x", pady=2)
+        line.pack(side="top", fill="x", pady=6)
 
         chk = ttk.Checkbutton(line, variable=row.checked, width=6)
         chk.pack(side="left", padx=2)
@@ -292,8 +292,8 @@ class DefectInspectorApp:
         except Exception:
             row.thumb_img = None
 
-        thumb_lbl = ttk.Label(line, image=row.thumb_img, width=10)
-        thumb_lbl.pack(side="left", padx=2)
+        thumb_lbl = ttk.Label(line, image=row.thumb_img, width=20)
+        thumb_lbl.pack(side="left", padx=4, pady=4)
 
         name_lbl = ttk.Label(line, text=os.path.basename(row.path), width=28, anchor="w")
         name_lbl.pack(side="left", padx=2)
