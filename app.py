@@ -4,10 +4,10 @@
 ------------------------------------------------
 - 이미지 폴더/파일 불러오기 (모든 이미지 형식)
 - 불량 유형 정의 텍스트 입력/저장 (작성자가 직접 정의, 참고 문서로 저장됨)
-- 판정 유형(카테고리) 추가 관리 (기본: K 유기 / K 갈림 / NK 유기 / 핀홀)
+- 판정 유형(카테고리) 추가/삭제 관리 (기본: K 유기 / K 갈림 / NK 유기 / 핀홀)
 - 선택 이미지 일괄 작업자 판정값 입력
 - AI 학습하기 (작업자가 입력한 판정값 기반, 누적 데이터로 재학습)
-- 자동 판정 (학습된 모델로 예측 + 신뢰율 표시)
+- 자동 판정 (학습된 모델로 예측 + 신뢰율 표시, 신뢰율 70% 미만 행은 연핑크 음영 표시)
 - 데이터/모델 저장 및 백업
 
 실행: python app.py
@@ -42,6 +42,15 @@ IMAGE_EXTS = (
 
 THUMB_SIZE = (200, 200)
 
+# 표(grid) 컬럼 순서/픽셀 폭 - 헤더와 데이터 행이 같은 부모(grid)를 공유하므로
+# 여기서 지정한 폭이 헤더/행 모두에 동일하게 적용되어 줄이 어긋나지 않습니다.
+COLUMNS = ["선택", "이미지", "파일명", "자동판정값", "신뢰율(%)", "작업자 판정값"]
+COL_WIDTHS = [60, 215, 260, 130, 110, 170]
+
+ROW_BG_NORMAL = "#ffffff"
+ROW_BG_LOWCONF = "#ffd9e8"   # 파스텔톤 연핑크
+LOW_CONF_THRESHOLD = 70.0    # % 미만이면 음영 처리
+
 
 class ImageRow:
     """표(grid)의 한 행에 대응하는 이미지 레코드"""
@@ -52,19 +61,20 @@ class ImageRow:
         self.confidence = tk.StringVar(value="-")
         self.worker_label = tk.StringVar(value="")
         self.thumb_img = None  # PhotoImage 참조 유지용
-        self.widgets = {}  # 행의 위젯들을 보관 (파괴/재구성용)
+        self.widgets = {}  # 행의 위젯들을 보관 (파괴/재구성/배경색 변경용)
 
 
 class DefectInspectorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("불량 이미지 자동 판정 프로그램")
-        self.root.geometry("1280x820")
+        self.root.geometry("1320x860")
 
         self.categories = data_store.load_categories()
         self.rules = data_store.load_rules()
         self.model = ModelManager()
         self.rows = []  # ImageRow 목록
+        self._next_grid_row = 1  # 0행은 헤더
 
         self.train_queue = queue.Queue()
 
@@ -82,6 +92,9 @@ class DefectInspectorApp:
             style.theme_use("clam")
         except Exception:
             pass
+        # 신뢰율 낮은 행의 콤보박스 배경색을 위한 커스텀 스타일
+        style.configure("LowConf.TCombobox", fieldbackground=ROW_BG_LOWCONF)
+        style.configure("Normal.TCombobox", fieldbackground=ROW_BG_NORMAL)
 
         # ---------- 상단 툴바 1: 불러오기 / 학습 / 판정 / 저장 ----------
         toolbar1 = ttk.Frame(self.root, padding=6)
@@ -111,21 +124,31 @@ class DefectInspectorApp:
         toolbar2 = ttk.LabelFrame(self.root, text="판정 유형 관리", padding=6)
         toolbar2.pack(side="top", fill="x", padx=6, pady=(0, 4))
 
-        ttk.Label(toolbar2, text="새 유형 추가:").pack(side="left")
-        self.new_cat_entry = ttk.Entry(toolbar2, width=18)
+        row2a = ttk.Frame(toolbar2)
+        row2a.pack(side="top", fill="x")
+        ttk.Label(row2a, text="새 유형 추가:").pack(side="left")
+        self.new_cat_entry = ttk.Entry(row2a, width=18)
         self.new_cat_entry.pack(side="left", padx=4)
-        ttk.Button(toolbar2, text="추가", command=self.add_category).pack(side="left", padx=4)
+        ttk.Button(row2a, text="추가", command=self.add_category).pack(side="left", padx=4)
 
-        ttk.Separator(toolbar2, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Separator(row2a, orient="vertical").pack(side="left", fill="y", padx=10)
 
-        ttk.Label(toolbar2, text="선택한 이미지 일괄 판정값:").pack(side="left")
-        self.batch_combo = ttk.Combobox(toolbar2, values=self.categories,
+        ttk.Label(row2a, text="유형 삭제:").pack(side="left")
+        self.delete_cat_combo = ttk.Combobox(row2a, values=self.categories,
+                                              width=16, state="readonly")
+        self.delete_cat_combo.pack(side="left", padx=4)
+        ttk.Button(row2a, text="삭제", command=self.delete_category).pack(side="left", padx=4)
+
+        row2b = ttk.Frame(toolbar2)
+        row2b.pack(side="top", fill="x", pady=(6, 0))
+        ttk.Label(row2b, text="선택한 이미지 일괄 판정값:").pack(side="left")
+        self.batch_combo = ttk.Combobox(row2b, values=self.categories,
                                          width=16, state="readonly")
         self.batch_combo.pack(side="left", padx=4)
-        ttk.Button(toolbar2, text="선택 항목에 적용",
+        ttk.Button(row2b, text="선택 항목에 적용",
                    command=self.apply_batch_label).pack(side="left", padx=4)
-        ttk.Button(toolbar2, text="전체 선택", command=self.select_all).pack(side="left", padx=4)
-        ttk.Button(toolbar2, text="전체 해제", command=self.deselect_all).pack(side="left", padx=4)
+        ttk.Button(row2b, text="전체 선택", command=self.select_all).pack(side="left", padx=4)
+        ttk.Button(row2b, text="전체 해제", command=self.deselect_all).pack(side="left", padx=4)
 
         # ---------- 상단 툴바 3: 불량 유형 정의(룰) 텍스트 ----------
         toolbar3 = ttk.LabelFrame(self.root, text="불량 유형 정의 (작성자가 직접 입력 / 판정 참고자료로 저장)", padding=6)
@@ -143,20 +166,16 @@ class DefectInspectorApp:
         self.rule_text = tk.Text(toolbar3, height=4, wrap="word")
         self.rule_text.pack(side="top", fill="x", pady=(4, 0))
 
-        # ---------- 표 헤더 ----------
-        header = ttk.Frame(self.root, padding=(10, 4))
-        header.pack(side="top", fill="x")
-        headers = [
-            ("선택", 6), ("이미지", 10), ("파일명", 28),
-            ("자동판정값", 14), ("AI 신뢰율(%)", 12), ("작업자 판정값", 18)
-        ]
-        for text, w in headers:
-            ttk.Label(header, text=text, width=w, anchor="center",
-                      font=("맑은 고딕", 9, "bold")).pack(side="left", padx=2)
+        # ---------- 안내: 신뢰율 음영 표시 ----------
+        legend = ttk.Frame(self.root, padding=(10, 2))
+        legend.pack(side="top", fill="x")
+        swatch = tk.Label(legend, text="   ", bg=ROW_BG_LOWCONF, relief="solid", borderwidth=1)
+        swatch.pack(side="left", padx=(0, 4))
+        ttk.Label(legend, text=f"= AI 신뢰율 {LOW_CONF_THRESHOLD:.0f}% 미만 (재검수 권장)").pack(side="left")
 
-        # ---------- 스크롤 가능한 이미지 목록 영역 ----------
+        # ---------- 스크롤 가능한 표 영역 (헤더 + 데이터 행이 같은 grid 부모를 공유) ----------
         list_container = ttk.Frame(self.root)
-        list_container.pack(side="top", fill="both", expand=True, padx=6, pady=(0, 6))
+        list_container.pack(side="top", fill="both", expand=True, padx=6, pady=(4, 6))
 
         self.canvas = tk.Canvas(list_container, borderwidth=0, highlightthickness=0)
         vsb = ttk.Scrollbar(list_container, orient="vertical", command=self.canvas.yview)
@@ -164,13 +183,23 @@ class DefectInspectorApp:
         vsb.pack(side="right", fill="y")
         self.canvas.pack(side="left", fill="both", expand=True)
 
-        self.rows_frame = ttk.Frame(self.canvas)
-        self.rows_frame_id = self.canvas.create_window((0, 0), window=self.rows_frame, anchor="nw")
-        self.rows_frame.bind("<Configure>",
-                              lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.table_frame = tk.Frame(self.canvas, bg=ROW_BG_NORMAL)
+        self.table_frame_id = self.canvas.create_window((0, 0), window=self.table_frame, anchor="nw")
+        self.table_frame.bind("<Configure>",
+                               lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.bind("<Configure>",
-                          lambda e: self.canvas.itemconfig(self.rows_frame_id, width=e.width))
+                          lambda e: self.canvas.itemconfig(self.table_frame_id, width=e.width))
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+        # 컬럼 폭을 고정해서 헤더와 데이터 행의 줄을 맞춤
+        for i, w in enumerate(COL_WIDTHS):
+            self.table_frame.grid_columnconfigure(i, minsize=w)
+
+        # 헤더 (0행)
+        for i, text in enumerate(COLUMNS):
+            tk.Label(self.table_frame, text=text, font=("맑은 고딕", 9, "bold"),
+                     bg="#e3e3e3", anchor="center", relief="groove", borderwidth=1
+                     ).grid(row=0, column=i, sticky="nsew", padx=0, pady=0, ipady=4)
 
     def _on_mousewheel(self, event):
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -184,6 +213,7 @@ class DefectInspectorApp:
     def _refresh_all_category_widgets(self):
         self.batch_combo["values"] = self.categories
         self.rule_combo["values"] = self.categories
+        self.delete_cat_combo["values"] = self.categories
         for row in self.rows:
             cb = row.widgets.get("worker_combo")
             if cb is not None:
@@ -202,6 +232,29 @@ class DefectInspectorApp:
         self.new_cat_entry.delete(0, "end")
         self._refresh_all_category_widgets()
         self._update_status(f"'{name}' 유형이 추가되었습니다.")
+
+    def delete_category(self):
+        cat = self.delete_cat_combo.get()
+        if not cat:
+            messagebox.showwarning("알림", "삭제할 유형을 먼저 선택하세요.")
+            return
+        if cat not in self.categories:
+            return
+        if not messagebox.askyesno(
+            "삭제 확인",
+            f"'{cat}' 유형을 목록에서 삭제하시겠습니까?\n\n"
+            f"이미 이 유형으로 저장된 학습 데이터(data/labeled_images/{cat})는 "
+            f"삭제되지 않고 그대로 보존됩니다.\n"
+            f"단, 새로 판정할 때 더 이상 이 유형을 선택할 수 없게 됩니다."
+        ):
+            return
+        self.categories.remove(cat)
+        data_store.save_categories(self.categories)
+        if cat in self.rules:
+            del self.rules[cat]
+            data_store.save_rules(self.rules)
+        self._refresh_all_category_widgets()
+        self._update_status(f"'{cat}' 유형이 삭제되었습니다.")
 
     # ------------------------------------------------------------------
     # 불량 유형 정의(룰 텍스트)
@@ -273,17 +326,20 @@ class DefectInspectorApp:
                 except Exception:
                     pass
         self.rows = []
+        self._next_grid_row = 1
         self._update_status("목록을 비웠습니다.")
 
     # ------------------------------------------------------------------
-    # 행 위젯 생성
+    # 행 위젯 생성 (헤더와 동일한 grid 부모(table_frame) 사용 -> 줄 자동 정렬)
     # ------------------------------------------------------------------
     def _create_row_widgets(self, row: ImageRow):
-        line = ttk.Frame(self.rows_frame)
-        line.pack(side="top", fill="x", pady=6)
+        r = self._next_grid_row
+        self._next_grid_row += 1
+        bg = ROW_BG_NORMAL
 
-        chk = ttk.Checkbutton(line, variable=row.checked, width=6)
-        chk.pack(side="left", padx=2)
+        chk = tk.Checkbutton(self.table_frame, variable=row.checked, bg=bg,
+                              activebackground=bg, highlightthickness=0)
+        chk.grid(row=r, column=0, sticky="nsew", padx=0, pady=1)
 
         try:
             im = Image.open(row.path)
@@ -292,26 +348,47 @@ class DefectInspectorApp:
         except Exception:
             row.thumb_img = None
 
-        thumb_lbl = ttk.Label(line, image=row.thumb_img, width=20)
-        thumb_lbl.pack(side="left", padx=4, pady=4)
+        thumb_lbl = tk.Label(self.table_frame, image=row.thumb_img, bg=bg)
+        thumb_lbl.grid(row=r, column=1, sticky="nsew", padx=4, pady=4)
 
-        name_lbl = ttk.Label(line, text=os.path.basename(row.path), width=28, anchor="w")
-        name_lbl.pack(side="left", padx=2)
+        name_lbl = tk.Label(self.table_frame, text=os.path.basename(row.path),
+                             bg=bg, anchor="w", wraplength=COL_WIDTHS[2] - 10, justify="left")
+        name_lbl.grid(row=r, column=2, sticky="nsew", padx=6, pady=4)
 
-        auto_lbl = ttk.Label(line, textvariable=row.auto_label, width=14, anchor="center")
-        auto_lbl.pack(side="left", padx=2)
+        auto_lbl = tk.Label(self.table_frame, textvariable=row.auto_label, bg=bg, anchor="center")
+        auto_lbl.grid(row=r, column=3, sticky="nsew", padx=2, pady=4)
 
-        conf_lbl = ttk.Label(line, textvariable=row.confidence, width=12, anchor="center")
-        conf_lbl.pack(side="left", padx=2)
+        conf_lbl = tk.Label(self.table_frame, textvariable=row.confidence, bg=bg, anchor="center")
+        conf_lbl.grid(row=r, column=4, sticky="nsew", padx=2, pady=4)
 
-        worker_combo = ttk.Combobox(line, textvariable=row.worker_label,
-                                     values=self.categories, width=16, state="readonly")
-        worker_combo.pack(side="left", padx=2)
+        worker_combo = ttk.Combobox(self.table_frame, textvariable=row.worker_label,
+                                     values=self.categories, width=16, state="readonly",
+                                     style="Normal.TCombobox")
+        worker_combo.grid(row=r, column=5, sticky="nsew", padx=6, pady=4)
+
+        # 각 셀 사이 얇은 구분선 느낌을 위해 행 전체 테두리
+        for col in range(len(COLUMNS)):
+            self.table_frame.grid_rowconfigure(r, minsize=THUMB_SIZE[1] + 8)
 
         row.widgets = {
-            "line": line, "chk": chk, "thumb": thumb_lbl, "name": name_lbl,
+            "chk": chk, "thumb": thumb_lbl, "name": name_lbl,
             "auto": auto_lbl, "conf": conf_lbl, "worker_combo": worker_combo,
         }
+
+    def _set_row_bg(self, row: ImageRow, low_conf: bool):
+        bg = ROW_BG_LOWCONF if low_conf else ROW_BG_NORMAL
+        for key in ("chk", "thumb", "name", "auto", "conf"):
+            w = row.widgets.get(key)
+            if w is not None:
+                try:
+                    w.configure(bg=bg)
+                    if key == "chk":
+                        w.configure(activebackground=bg)
+                except Exception:
+                    pass
+        combo = row.widgets.get("worker_combo")
+        if combo is not None:
+            combo.configure(style="LowConf.TCombobox" if low_conf else "Normal.TCombobox")
 
     # ------------------------------------------------------------------
     # 선택/일괄 판정
@@ -467,7 +544,9 @@ class DefectInspectorApp:
                 if msg[0] == "predict_row":
                     _, row, label, conf, i, total = msg
                     row.auto_label.set(label if label else "-")
-                    row.confidence.set(f"{conf*100:.1f}" if label else "-")
+                    conf_pct = conf * 100 if label else 0.0
+                    row.confidence.set(f"{conf_pct:.1f}" if label else "-")
+                    self._set_row_bg(row, low_conf=bool(label) and conf_pct < LOW_CONF_THRESHOLD)
                     self.progress.configure(value=i)
                     self._update_status(f"자동 판정 중... {i}/{total}")
                 elif msg[0] == "predict_done":
