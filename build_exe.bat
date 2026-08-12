@@ -24,6 +24,7 @@ pyinstaller --noconfirm --onefile --windowed ^
     --collect-all sklearn ^
     --collect-all skimage ^
     --collect-all cv2 ^
+    --collect-all openpyxl ^
     --hidden-import "PIL._tkinter_finder" ^
     app.py
 

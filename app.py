@@ -3,21 +3,28 @@
 불량 이미지 자동 판정 프로그램 (Defect Inspector)
 ------------------------------------------------
 - 이미지 폴더/파일 불러오기 (모든 이미지 형식)
+- 파일명에서 LOT / GLS / X / Y 좌표 자동 파싱
+    예) 64N68001AQ0_64N67002720_64N6700272UC4_TPTN2603_1011_21.829_1203.322_F1II_01.jpg
+        -> LOT=64N68001AQ0, GLS=64N67002720, X=21.829, Y=1203.322
 - 불량 유형 정의 텍스트 입력/저장 (작성자가 직접 정의, 참고 문서로 저장됨)
-- 판정 유형(카테고리) 추가/삭제 관리 (기본: K 유기 / K 갈림 / NK 유기 / 핀홀)
+- 판정 유형(카테고리) 추가/삭제 관리
+- 표 컬럼: 선택 / 이미지 / LOT / GLS / X / Y / AI판정 / 신뢰율(%) / 작업자 판정
+- LOT, GLS, X, Y, AI판정, 신뢰율(%), 작업자 판정 필터 기능
 - 선택 이미지 일괄 작업자 판정값 입력
-- AI 학습하기 (작업자가 입력한 판정값 기반, 누적 데이터로 재학습)
-- 자동 판정 (학습된 모델로 예측 + 신뢰율 표시, 신뢰율 70% 미만 행은 연핑크 음영 표시)
+- AI 학습하기 / 자동 판정 (신뢰율 70% 미만 행은 파스텔 연핑크 음영)
+- MAP 버튼: 선택된 이미지들의 X-Y 좌표를 좌표평면에 타점으로 표시, 점 클릭 시 이미지 확인
+- 엑셀로 내보내기 (현재 화면에 보이는 항목 기준)
 - 데이터/모델 저장 및 백업
 
 실행: python app.py
-배포용 EXE 빌드: build_exe.bat (PyInstaller) 참고
+배포용 EXE 빌드: build_exe.bat (PyInstaller) 또는 .github/workflows/build.yml (GitHub Actions) 참고
 """
 
 import os
 import sys
 import threading
 import queue
+import tempfile
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -26,9 +33,15 @@ from PIL import Image, ImageTk
 import data_store
 from model_manager import ModelManager
 
+try:
+    from openpyxl import Workbook
+    from openpyxl.drawing.image import Image as XLImage
+    from openpyxl.utils import get_column_letter
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+
 # PyInstaller(onefile)로 실행될 경우, 실행 파일이 위치한 폴더를 작업 폴더로 고정합니다.
-# 이렇게 해야 data/, model/ 폴더가 임시 압축 해제 폴더가 아닌
-# exe 파일 옆에 생성/유지되어 재실행 시에도 데이터가 보존됩니다.
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(sys.executable)
 else:
@@ -41,45 +54,80 @@ IMAGE_EXTS = (
 )
 
 THUMB_SIZE = (200, 200)
+MAP_THUMB_SIZE = (150, 150)
 
-# 표(grid) 컬럼 순서/픽셀 폭 - 헤더와 데이터 행이 같은 부모(grid)를 공유하므로
-# 여기서 지정한 폭이 헤더/행 모두에 동일하게 적용되어 줄이 어긋나지 않습니다.
-COLUMNS = ["선택", "이미지", "파일명", "자동판정값", "신뢰율(%)", "작업자 판정값"]
-COL_WIDTHS = [60, 215, 260, 130, 110, 170]
+X_RANGE = (0, 1500)
+Y_RANGE = (0, 1850)
+
+COLUMNS = ["선택", "이미지", "LOT", "GLS", "X", "Y", "AI판정", "신뢰율(%)", "작업자 판정"]
+COL_WIDTHS = [55, 215, 140, 140, 70, 70, 110, 100, 160]
+COL_KEYS = ["chk", "thumb", "lot", "gls", "x", "y", "auto", "conf", "worker_combo"]
 
 ROW_BG_NORMAL = "#ffffff"
 ROW_BG_LOWCONF = "#ffd9e8"   # 파스텔톤 연핑크
 LOW_CONF_THRESHOLD = 70.0    # % 미만이면 음영 처리
+
+ALL_FILTER = "전체"
+
+
+def parse_filename(path):
+    """
+    파일명 규칙: LOT_GLS_..._..._..._X_Y_..._...
+    예) 64N68001AQ0_64N67002720_64N6700272UC4_TPTN2603_1011_21.829_1203.322_F1II_01
+        parts[0]=LOT, parts[1]=GLS, parts[5]=X, parts[6]=Y
+    규칙에 맞지 않는 파일명은 LOT/GLS는 "-", X/Y는 None 으로 처리됩니다.
+    """
+    base = os.path.splitext(os.path.basename(path))[0]
+    parts = base.split("_")
+    lot = parts[0] if len(parts) > 0 and parts[0] else "-"
+    gls = parts[1] if len(parts) > 1 and parts[1] else "-"
+    x = y = None
+    if len(parts) > 6:
+        try:
+            x = float(parts[5])
+            y = float(parts[6])
+        except ValueError:
+            x = y = None
+    return lot, gls, x, y
+
+
+def _safe_float(text, default):
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return default
 
 
 class ImageRow:
     """표(grid)의 한 행에 대응하는 이미지 레코드"""
     def __init__(self, path):
         self.path = path
+        self.lot, self.gls, self.x, self.y = parse_filename(path)
         self.checked = tk.BooleanVar(value=False)
         self.auto_label = tk.StringVar(value="-")
         self.confidence = tk.StringVar(value="-")
         self.worker_label = tk.StringVar(value="")
         self.thumb_img = None  # PhotoImage 참조 유지용
-        self.widgets = {}  # 행의 위젯들을 보관 (파괴/재구성/배경색 변경용)
+        self.widgets = {}      # 행의 위젯들을 보관 (파괴/재구성/배경색/재배치용)
+        self.visible = True    # 필터 결과 표시 여부
 
 
 class DefectInspectorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("불량 이미지 자동 판정 프로그램")
-        self.root.geometry("1320x860")
+        self.root.geometry("1420x900")
 
         self.categories = data_store.load_categories()
         self.rules = data_store.load_rules()
         self.model = ModelManager()
         self.rows = []  # ImageRow 목록
-        self._next_grid_row = 1  # 0행은 헤더
 
         self.train_queue = queue.Queue()
 
         self._build_ui()
         self._refresh_all_category_widgets()
+        self._refresh_filter_options()
         self._update_status("준비 완료. 모델 학습 여부: " +
                              ("학습됨" if self.model.is_trained() else "미학습"))
 
@@ -92,11 +140,10 @@ class DefectInspectorApp:
             style.theme_use("clam")
         except Exception:
             pass
-        # 신뢰율 낮은 행의 콤보박스 배경색을 위한 커스텀 스타일
         style.configure("LowConf.TCombobox", fieldbackground=ROW_BG_LOWCONF)
         style.configure("Normal.TCombobox", fieldbackground=ROW_BG_NORMAL)
 
-        # ---------- 상단 툴바 1: 불러오기 / 학습 / 판정 / 저장 ----------
+        # ---------- 상단 툴바 1: 불러오기 / 학습 / 판정 / MAP / 엑셀 / 저장 ----------
         toolbar1 = ttk.Frame(self.root, padding=6)
         toolbar1.pack(side="top", fill="x")
 
@@ -110,12 +157,17 @@ class DefectInspectorApp:
         ttk.Button(toolbar1, text="⚡ 자동 판정",
                    command=self.auto_classify).pack(side="left", padx=3)
         ttk.Separator(toolbar1, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Button(toolbar1, text="🗺 MAP",
+                   command=self.open_map).pack(side="left", padx=3)
+        ttk.Button(toolbar1, text="📊 엑셀로 내보내기",
+                   command=self.export_excel).pack(side="left", padx=3)
+        ttk.Separator(toolbar1, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(toolbar1, text="💾 데이터 저장/백업",
                    command=self.backup_data).pack(side="left", padx=3)
         ttk.Button(toolbar1, text="🗑 목록 비우기",
                    command=self.clear_rows).pack(side="left", padx=3)
 
-        self.progress = ttk.Progressbar(toolbar1, mode="determinate", length=180)
+        self.progress = ttk.Progressbar(toolbar1, mode="determinate", length=160)
         self.progress.pack(side="right", padx=6)
         self.status_var = tk.StringVar(value="")
         ttk.Label(toolbar1, textvariable=self.status_var).pack(side="right", padx=8)
@@ -166,6 +218,64 @@ class DefectInspectorApp:
         self.rule_text = tk.Text(toolbar3, height=4, wrap="word")
         self.rule_text.pack(side="top", fill="x", pady=(4, 0))
 
+        # ---------- 상단 툴바 4: 필터 ----------
+        toolbar4 = ttk.LabelFrame(self.root, text="필터 (LOT / GLS / X / Y / AI판정 / 신뢰율 / 작업자 판정)", padding=6)
+        toolbar4.pack(side="top", fill="x", padx=6, pady=(0, 4))
+
+        f1 = ttk.Frame(toolbar4)
+        f1.pack(side="top", fill="x")
+        ttk.Label(f1, text="LOT:").pack(side="left")
+        self.filter_lot = ttk.Combobox(f1, values=[ALL_FILTER], width=14, state="readonly")
+        self.filter_lot.set(ALL_FILTER)
+        self.filter_lot.pack(side="left", padx=(2, 10))
+
+        ttk.Label(f1, text="GLS:").pack(side="left")
+        self.filter_gls = ttk.Combobox(f1, values=[ALL_FILTER], width=14, state="readonly")
+        self.filter_gls.set(ALL_FILTER)
+        self.filter_gls.pack(side="left", padx=(2, 10))
+
+        ttk.Label(f1, text="X:").pack(side="left")
+        self.filter_xmin = ttk.Entry(f1, width=6)
+        self.filter_xmin.insert(0, str(X_RANGE[0]))
+        self.filter_xmin.pack(side="left", padx=(2, 2))
+        ttk.Label(f1, text="~").pack(side="left")
+        self.filter_xmax = ttk.Entry(f1, width=6)
+        self.filter_xmax.insert(0, str(X_RANGE[1]))
+        self.filter_xmax.pack(side="left", padx=(2, 10))
+
+        ttk.Label(f1, text="Y:").pack(side="left")
+        self.filter_ymin = ttk.Entry(f1, width=6)
+        self.filter_ymin.insert(0, str(Y_RANGE[0]))
+        self.filter_ymin.pack(side="left", padx=(2, 2))
+        ttk.Label(f1, text="~").pack(side="left")
+        self.filter_ymax = ttk.Entry(f1, width=6)
+        self.filter_ymax.insert(0, str(Y_RANGE[1]))
+        self.filter_ymax.pack(side="left", padx=(2, 2))
+
+        f2 = ttk.Frame(toolbar4)
+        f2.pack(side="top", fill="x", pady=(6, 0))
+        ttk.Label(f2, text="AI판정:").pack(side="left")
+        self.filter_ai = ttk.Combobox(f2, values=[ALL_FILTER] + self.categories, width=14, state="readonly")
+        self.filter_ai.set(ALL_FILTER)
+        self.filter_ai.pack(side="left", padx=(2, 10))
+
+        ttk.Label(f2, text="신뢰율(%):").pack(side="left")
+        self.filter_confmin = ttk.Entry(f2, width=6)
+        self.filter_confmin.insert(0, "0")
+        self.filter_confmin.pack(side="left", padx=(2, 2))
+        ttk.Label(f2, text="~").pack(side="left")
+        self.filter_confmax = ttk.Entry(f2, width=6)
+        self.filter_confmax.insert(0, "100")
+        self.filter_confmax.pack(side="left", padx=(2, 10))
+
+        ttk.Label(f2, text="작업자 판정:").pack(side="left")
+        self.filter_worker = ttk.Combobox(f2, values=[ALL_FILTER] + self.categories, width=14, state="readonly")
+        self.filter_worker.set(ALL_FILTER)
+        self.filter_worker.pack(side="left", padx=(2, 10))
+
+        ttk.Button(f2, text="필터 적용", command=self.apply_filters).pack(side="left", padx=6)
+        ttk.Button(f2, text="필터 초기화", command=self.reset_filters).pack(side="left", padx=2)
+
         # ---------- 안내: 신뢰율 음영 표시 ----------
         legend = ttk.Frame(self.root, padding=(10, 2))
         legend.pack(side="top", fill="x")
@@ -191,7 +301,6 @@ class DefectInspectorApp:
                           lambda e: self.canvas.itemconfig(self.table_frame_id, width=e.width))
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
 
-        # 컬럼 폭을 고정해서 헤더와 데이터 행의 줄을 맞춤
         for i, w in enumerate(COL_WIDTHS):
             self.table_frame.grid_columnconfigure(i, minsize=w)
 
@@ -214,6 +323,8 @@ class DefectInspectorApp:
         self.batch_combo["values"] = self.categories
         self.rule_combo["values"] = self.categories
         self.delete_cat_combo["values"] = self.categories
+        self.filter_ai["values"] = [ALL_FILTER] + self.categories
+        self.filter_worker["values"] = [ALL_FILTER] + self.categories
         for row in self.rows:
             cb = row.widgets.get("worker_combo")
             if cb is not None:
@@ -312,6 +423,8 @@ class DefectInspectorApp:
             self._create_row_widgets(row)
             self.rows.append(row)
             added += 1
+        self._refresh_filter_options()
+        self.apply_filters()
         self._update_status(f"이미지 {added}장 추가됨 (전체 {len(self.rows)}장)")
 
     def clear_rows(self):
@@ -326,20 +439,18 @@ class DefectInspectorApp:
                 except Exception:
                     pass
         self.rows = []
-        self._next_grid_row = 1
+        self._refresh_filter_options()
         self._update_status("목록을 비웠습니다.")
 
     # ------------------------------------------------------------------
     # 행 위젯 생성 (헤더와 동일한 grid 부모(table_frame) 사용 -> 줄 자동 정렬)
+    # 생성 시점에는 grid 배치를 하지 않고, apply_filters()에서 일괄 배치합니다.
     # ------------------------------------------------------------------
     def _create_row_widgets(self, row: ImageRow):
-        r = self._next_grid_row
-        self._next_grid_row += 1
         bg = ROW_BG_NORMAL
 
         chk = tk.Checkbutton(self.table_frame, variable=row.checked, bg=bg,
                               activebackground=bg, highlightthickness=0)
-        chk.grid(row=r, column=0, sticky="nsew", padx=0, pady=1)
 
         try:
             im = Image.open(row.path)
@@ -349,35 +460,30 @@ class DefectInspectorApp:
             row.thumb_img = None
 
         thumb_lbl = tk.Label(self.table_frame, image=row.thumb_img, bg=bg)
-        thumb_lbl.grid(row=r, column=1, sticky="nsew", padx=4, pady=4)
 
-        name_lbl = tk.Label(self.table_frame, text=os.path.basename(row.path),
-                             bg=bg, anchor="w", wraplength=COL_WIDTHS[2] - 10, justify="left")
-        name_lbl.grid(row=r, column=2, sticky="nsew", padx=6, pady=4)
+        lot_lbl = tk.Label(self.table_frame, text=row.lot, bg=bg, anchor="center")
+        gls_lbl = tk.Label(self.table_frame, text=row.gls, bg=bg, anchor="center")
+        x_text = f"{row.x:.0f}" if row.x is not None else "-"
+        y_text = f"{row.y:.0f}" if row.y is not None else "-"
+        x_lbl = tk.Label(self.table_frame, text=x_text, bg=bg, anchor="center")
+        y_lbl = tk.Label(self.table_frame, text=y_text, bg=bg, anchor="center")
 
         auto_lbl = tk.Label(self.table_frame, textvariable=row.auto_label, bg=bg, anchor="center")
-        auto_lbl.grid(row=r, column=3, sticky="nsew", padx=2, pady=4)
-
         conf_lbl = tk.Label(self.table_frame, textvariable=row.confidence, bg=bg, anchor="center")
-        conf_lbl.grid(row=r, column=4, sticky="nsew", padx=2, pady=4)
 
         worker_combo = ttk.Combobox(self.table_frame, textvariable=row.worker_label,
                                      values=self.categories, width=16, state="readonly",
                                      style="Normal.TCombobox")
-        worker_combo.grid(row=r, column=5, sticky="nsew", padx=6, pady=4)
-
-        # 각 셀 사이 얇은 구분선 느낌을 위해 행 전체 테두리
-        for col in range(len(COLUMNS)):
-            self.table_frame.grid_rowconfigure(r, minsize=THUMB_SIZE[1] + 8)
 
         row.widgets = {
-            "chk": chk, "thumb": thumb_lbl, "name": name_lbl,
-            "auto": auto_lbl, "conf": conf_lbl, "worker_combo": worker_combo,
+            "chk": chk, "thumb": thumb_lbl, "lot": lot_lbl, "gls": gls_lbl,
+            "x": x_lbl, "y": y_lbl, "auto": auto_lbl, "conf": conf_lbl,
+            "worker_combo": worker_combo,
         }
 
     def _set_row_bg(self, row: ImageRow, low_conf: bool):
         bg = ROW_BG_LOWCONF if low_conf else ROW_BG_NORMAL
-        for key in ("chk", "thumb", "name", "auto", "conf"):
+        for key in ("chk", "thumb", "lot", "gls", "x", "y", "auto", "conf"):
             w = row.widgets.get(key)
             if w is not None:
                 try:
@@ -391,11 +497,102 @@ class DefectInspectorApp:
             combo.configure(style="LowConf.TCombobox" if low_conf else "Normal.TCombobox")
 
     # ------------------------------------------------------------------
+    # 필터
+    # ------------------------------------------------------------------
+    def _refresh_filter_options(self):
+        lots = sorted({r.lot for r in self.rows if r.lot and r.lot != "-"})
+        glss = sorted({r.gls for r in self.rows if r.gls and r.gls != "-"})
+        cur_lot = self.filter_lot.get()
+        cur_gls = self.filter_gls.get()
+        self.filter_lot["values"] = [ALL_FILTER] + lots
+        self.filter_gls["values"] = [ALL_FILTER] + glss
+        if cur_lot not in self.filter_lot["values"]:
+            self.filter_lot.set(ALL_FILTER)
+        if cur_gls not in self.filter_gls["values"]:
+            self.filter_gls.set(ALL_FILTER)
+
+    def reset_filters(self):
+        self.filter_lot.set(ALL_FILTER)
+        self.filter_gls.set(ALL_FILTER)
+        self.filter_xmin.delete(0, "end"); self.filter_xmin.insert(0, str(X_RANGE[0]))
+        self.filter_xmax.delete(0, "end"); self.filter_xmax.insert(0, str(X_RANGE[1]))
+        self.filter_ymin.delete(0, "end"); self.filter_ymin.insert(0, str(Y_RANGE[0]))
+        self.filter_ymax.delete(0, "end"); self.filter_ymax.insert(0, str(Y_RANGE[1]))
+        self.filter_ai.set(ALL_FILTER)
+        self.filter_confmin.delete(0, "end"); self.filter_confmin.insert(0, "0")
+        self.filter_confmax.delete(0, "end"); self.filter_confmax.insert(0, "100")
+        self.filter_worker.set(ALL_FILTER)
+        self.apply_filters()
+
+    def apply_filters(self):
+        lot = self.filter_lot.get()
+        gls = self.filter_gls.get()
+        xmin = _safe_float(self.filter_xmin.get(), X_RANGE[0])
+        xmax = _safe_float(self.filter_xmax.get(), X_RANGE[1])
+        ymin = _safe_float(self.filter_ymin.get(), Y_RANGE[0])
+        ymax = _safe_float(self.filter_ymax.get(), Y_RANGE[1])
+        ai = self.filter_ai.get()
+        confmin = _safe_float(self.filter_confmin.get(), 0)
+        confmax = _safe_float(self.filter_confmax.get(), 100)
+        worker = self.filter_worker.get()
+
+        x_default = (xmin == X_RANGE[0] and xmax == X_RANGE[1])
+        y_default = (ymin == Y_RANGE[0] and ymax == Y_RANGE[1])
+        conf_default = (confmin == 0 and confmax == 100)
+
+        for row in self.rows:
+            ok = True
+            if lot and lot != ALL_FILTER and row.lot != lot:
+                ok = False
+            if ok and gls and gls != ALL_FILTER and row.gls != gls:
+                ok = False
+            if ok and row.x is not None and not (xmin <= row.x <= xmax):
+                ok = False
+            elif ok and row.x is None and not x_default:
+                ok = False
+            if ok and row.y is not None and not (ymin <= row.y <= ymax):
+                ok = False
+            elif ok and row.y is None and not y_default:
+                ok = False
+            if ok and ai and ai != ALL_FILTER and row.auto_label.get() != ai:
+                ok = False
+            if ok:
+                conf_val = _safe_float(row.confidence.get(), None)
+                if conf_val is not None:
+                    if not (confmin <= conf_val <= confmax):
+                        ok = False
+                elif not conf_default:
+                    ok = False
+            if ok and worker and worker != ALL_FILTER and row.worker_label.get() != worker:
+                ok = False
+            row.visible = ok
+
+        self._relayout_visible_rows()
+        shown = sum(1 for r in self.rows if r.visible)
+        self._update_status(f"필터 적용됨: {shown} / {len(self.rows)} 장 표시 중")
+
+    def _relayout_visible_rows(self):
+        r = 1  # 0행은 헤더
+        for row in self.rows:
+            if row.visible:
+                for col, key in enumerate(COL_KEYS):
+                    w = row.widgets[key]
+                    padx = 4 if key == "thumb" else (6 if key in ("lot", "gls", "worker_combo") else 2)
+                    pady = 4 if key in ("thumb", "lot", "gls", "x", "y", "auto", "conf", "worker_combo") else 1
+                    w.grid(row=r, column=col, sticky="nsew", padx=padx, pady=pady)
+                self.table_frame.grid_rowconfigure(r, minsize=THUMB_SIZE[1] + 8)
+                r += 1
+            else:
+                for w in row.widgets.values():
+                    w.grid_remove()
+
+    # ------------------------------------------------------------------
     # 선택/일괄 판정
     # ------------------------------------------------------------------
     def select_all(self):
         for r in self.rows:
-            r.checked.set(True)
+            if r.visible:
+                r.checked.set(True)
 
     def deselect_all(self):
         for r in self.rows:
@@ -422,7 +619,6 @@ class DefectInspectorApp:
                             if r.worker_label.get().strip()]
 
         if not session_labeled:
-            # 현재 화면에 새로 라벨링한 것이 없으면 기존 누적 데이터셋만으로 재학습 시도
             dataset = data_store.load_dataset()
             if len(dataset) < 2:
                 messagebox.showwarning(
@@ -433,14 +629,12 @@ class DefectInspectorApp:
                 return
             combined = dataset
         else:
-            # 세션에서 라벨링한 이미지는 데이터셋 폴더로 복사/누적 저장
             for path, label in session_labeled:
                 try:
                     data_store.add_labeled_image(path, label)
                 except Exception as e:
                     print("labeled image copy failed:", e)
             dataset = data_store.load_dataset()
-            # 중복 제거 (동일 경로 최신 라벨 우선)
             merged = {}
             for path, label in dataset:
                 merged[path] = label
@@ -502,7 +696,6 @@ class DefectInspectorApp:
 
     def _set_controls_enabled(self, enabled):
         state = "normal" if enabled else "disabled"
-        # 버튼류만 순회하며 상태 변경 (Progressbar 등 제외)
         def _walk(widget):
             for child in widget.winfo_children():
                 if isinstance(child, (ttk.Button,)):
@@ -529,7 +722,7 @@ class DefectInspectorApp:
             for i, row in enumerate(self.rows):
                 try:
                     label, conf = self.model.predict(row.path)
-                except Exception as e:
+                except Exception:
                     label, conf = "오류", 0.0
                 self.train_queue.put(("predict_row", row, label, conf, i + 1, len(self.rows)))
             self.train_queue.put(("predict_done",))
@@ -553,10 +746,196 @@ class DefectInspectorApp:
                     self._set_controls_enabled(True)
                     self.progress.configure(value=0)
                     self._update_status("자동 판정이 완료되었습니다.")
+                    self.apply_filters()
                     return
         except queue.Empty:
             pass
         self.root.after(100, self._poll_predict_queue)
+
+    # ------------------------------------------------------------------
+    # MAP
+    # ------------------------------------------------------------------
+    def open_map(self):
+        selected = [r for r in self.rows if r.checked.get()]
+        if not selected:
+            messagebox.showwarning("알림", "MAP에 표시할 이미지를 먼저 체크박스로 선택하세요.")
+            return
+        selected = [r for r in selected if r.x is not None and r.y is not None]
+        if not selected:
+            messagebox.showwarning("알림", "선택된 이미지 중 X/Y 좌표를 인식할 수 있는 이미지가 없습니다.\n"
+                                          "(파일명 규칙을 확인해주세요)")
+            return
+
+        popup = tk.Toplevel(self.root)
+        popup.title(f"MAP - 선택 이미지 {len(selected)}개")
+        popup.geometry("1020x800")
+
+        main_frame = ttk.Frame(popup)
+        main_frame.pack(fill="both", expand=True, padx=8, pady=8)
+
+        map_frame = ttk.LabelFrame(
+            main_frame, text="X-Y 좌표 맵 (점을 클릭하면 해당 이미지가 표시됩니다. 여러 점 선택 가능)")
+        map_frame.pack(side="left", fill="y", padx=(0, 8))
+
+        CANVAS_W, CANVAS_H = 560, 690
+        MARGIN = 34
+        plot_w = CANVAS_W - 2 * MARGIN
+        plot_h = CANVAS_H - 2 * MARGIN
+
+        map_canvas = tk.Canvas(map_frame, width=CANVAS_W, height=CANVAS_H, bg="white",
+                                highlightthickness=0)
+        map_canvas.pack(padx=6, pady=6)
+
+        map_canvas.create_rectangle(MARGIN, MARGIN, MARGIN + plot_w, MARGIN + plot_h, outline="#888")
+        map_canvas.create_text(MARGIN, MARGIN + plot_h + 14, text=f"X:{X_RANGE[0]}", anchor="w",
+                                font=("맑은 고딕", 8))
+        map_canvas.create_text(MARGIN + plot_w, MARGIN + plot_h + 14, text=f"X:{X_RANGE[1]}", anchor="e",
+                                font=("맑은 고딕", 8))
+        map_canvas.create_text(MARGIN - 4, MARGIN, text=f"Y:{Y_RANGE[1]}", anchor="e", font=("맑은 고딕", 8))
+        map_canvas.create_text(MARGIN - 4, MARGIN + plot_h, text=f"Y:{Y_RANGE[0]}", anchor="e",
+                                font=("맑은 고딕", 8))
+
+        def to_canvas_xy(x, y):
+            cx = MARGIN + (x / X_RANGE[1]) * plot_w
+            # 좌하단이 (0,0)이 되도록 Y축을 반전 (y가 클수록 위로 올라감)
+            cy = MARGIN + plot_h - (y / Y_RANGE[1]) * plot_h
+            return cx, cy
+
+        dot_refs = {}
+        for row in selected:
+            cx, cy = to_canvas_xy(row.x, row.y)
+            dot_id = map_canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5,
+                                             fill="#4a90d9", outline="#20406e", width=1)
+            dot_refs[dot_id] = row
+
+        detail_frame = ttk.LabelFrame(main_frame, text="선택된 좌표 이미지")
+        detail_frame.pack(side="left", fill="both", expand=True)
+
+        detail_canvas = tk.Canvas(detail_frame, borderwidth=0, highlightthickness=0)
+        detail_vsb = ttk.Scrollbar(detail_frame, orient="vertical", command=detail_canvas.yview)
+        detail_canvas.configure(yscrollcommand=detail_vsb.set)
+        detail_vsb.pack(side="right", fill="y")
+        detail_canvas.pack(side="left", fill="both", expand=True)
+
+        detail_inner = ttk.Frame(detail_canvas)
+        detail_window = detail_canvas.create_window((0, 0), window=detail_inner, anchor="nw")
+        detail_inner.bind("<Configure>",
+                           lambda e: detail_canvas.configure(scrollregion=detail_canvas.bbox("all")))
+        detail_canvas.bind("<Configure>",
+                            lambda e: detail_canvas.itemconfig(detail_window, width=e.width))
+
+        popup._map_photo_refs = []
+        map_selected_set = set()
+
+        def refresh_detail_panel():
+            for w in detail_inner.winfo_children():
+                w.destroy()
+            popup._map_photo_refs.clear()
+            if not map_selected_set:
+                ttk.Label(detail_inner, text="맵에서 점을 클릭하면 해당 이미지가 여기에 표시됩니다.",
+                          padding=10).pack(anchor="w")
+                return
+            for row in map_selected_set:
+                item = ttk.Frame(detail_inner, padding=6, relief="groove")
+                item.pack(side="top", fill="x", pady=3, padx=3)
+                try:
+                    im = Image.open(row.path)
+                    im.thumbnail(MAP_THUMB_SIZE)
+                    photo = ImageTk.PhotoImage(im)
+                    popup._map_photo_refs.append(photo)
+                    tk.Label(item, image=photo).pack(side="left", padx=(0, 10))
+                except Exception:
+                    ttk.Label(item, text="[이미지 로드 실패]").pack(side="left", padx=(0, 10))
+                info = ttk.Frame(item)
+                info.pack(side="left", anchor="n")
+                ttk.Label(info, text=f"X: {row.x:.0f}   Y: {row.y:.0f}",
+                          font=("맑은 고딕", 10, "bold")).pack(anchor="w")
+                ttk.Label(info, text=f"LOT: {row.lot}").pack(anchor="w")
+                ttk.Label(info, text=f"GLS: {row.gls}").pack(anchor="w")
+                ttk.Label(info, text=f"AI판정: {row.auto_label.get()}   신뢰율: {row.confidence.get()}%").pack(anchor="w")
+                ttk.Label(info, text=f"작업자 판정: {row.worker_label.get() or '-'}").pack(anchor="w")
+
+        def on_map_click(event):
+            closest = map_canvas.find_closest(event.x, event.y)
+            if not closest:
+                return
+            dot_id = closest[0]
+            row = dot_refs.get(dot_id)
+            if row is None:
+                return
+            coords = map_canvas.coords(dot_id)
+            if not coords:
+                return
+            ccx, ccy = (coords[0] + coords[2]) / 2, (coords[1] + coords[3]) / 2
+            if ((event.x - ccx) ** 2 + (event.y - ccy) ** 2) ** 0.5 > 10:
+                return
+            if row in map_selected_set:
+                map_selected_set.remove(row)
+                map_canvas.itemconfig(dot_id, fill="#4a90d9", outline="#20406e")
+            else:
+                map_selected_set.add(row)
+                map_canvas.itemconfig(dot_id, fill="#ff5a8c", outline="#a10047")
+            refresh_detail_panel()
+
+        map_canvas.bind("<Button-1>", on_map_click)
+        refresh_detail_panel()
+
+    # ------------------------------------------------------------------
+    # 엑셀 내보내기
+    # ------------------------------------------------------------------
+    def export_excel(self):
+        if not OPENPYXL_AVAILABLE:
+            messagebox.showerror("오류", "엑셀 내보내기 기능을 사용하려면 'openpyxl' 라이브러리가 필요합니다.\n"
+                                        "requirements.txt에 openpyxl을 추가한 뒤 다시 빌드해주세요.")
+            return
+        visible_rows = [r for r in self.rows if r.visible]
+        if not visible_rows:
+            messagebox.showwarning("알림", "내보낼 항목이 없습니다. (필터 결과가 비어있습니다)")
+            return
+
+        dest = filedialog.asksaveasfilename(
+            title="엑셀로 저장", defaultextension=".xlsx",
+            filetypes=[("Excel 파일", "*.xlsx")], initialfile="판정결과.xlsx")
+        if not dest:
+            return
+
+        try:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "판정결과"
+            ws.append(["선택", "이미지", "LOT", "GLS", "X", "Y", "AI판정", "신뢰율(%)", "작업자 판정"])
+
+            widths = {"A": 6, "B": 16, "C": 16, "D": 16, "E": 8, "F": 8, "G": 12, "H": 12, "I": 14}
+            for col, w in widths.items():
+                ws.column_dimensions[col].width = w
+
+            tmp_dir = tempfile.mkdtemp(prefix="defect_inspector_xlsx_")
+            for i, row in enumerate(visible_rows, start=2):
+                ws.cell(row=i, column=1, value="O" if row.checked.get() else "")
+                ws.cell(row=i, column=3, value=row.lot)
+                ws.cell(row=i, column=4, value=row.gls)
+                ws.cell(row=i, column=5, value=round(row.x) if row.x is not None else "")
+                ws.cell(row=i, column=6, value=round(row.y) if row.y is not None else "")
+                ws.cell(row=i, column=7, value=row.auto_label.get())
+                ws.cell(row=i, column=8, value=row.confidence.get())
+                ws.cell(row=i, column=9, value=row.worker_label.get())
+                ws.row_dimensions[i].height = 66
+
+                try:
+                    thumb_path = os.path.join(tmp_dir, f"thumb_{i}.png")
+                    im = Image.open(row.path).convert("RGB")
+                    im.thumbnail((85, 85))
+                    im.save(thumb_path)
+                    xlimg = XLImage(thumb_path)
+                    ws.add_image(xlimg, f"B{i}")
+                except Exception:
+                    pass
+
+            wb.save(dest)
+            messagebox.showinfo("완료", f"엑셀 파일로 저장되었습니다.\n\n{dest}")
+            self._update_status(f"엑셀 내보내기 완료: {dest}")
+        except Exception as e:
+            messagebox.showerror("엑셀 저장 오류", str(e))
 
     # ------------------------------------------------------------------
     # 저장/백업
