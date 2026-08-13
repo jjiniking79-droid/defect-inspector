@@ -774,7 +774,7 @@ class DefectInspectorApp:
         main_frame.pack(fill="both", expand=True, padx=8, pady=8)
 
         map_frame = ttk.LabelFrame(
-            main_frame, text="X-Y 좌표 맵 (점을 클릭하면 해당 이미지가 표시됩니다. 여러 점 선택 가능)")
+            main_frame, text="X-Y 좌표 맵 (점 클릭 또는 마우스 드래그로 영역 선택 - 여러 점 선택 가능)")
         map_frame.pack(side="left", fill="y", padx=(0, 8))
 
         CANVAS_W, CANVAS_H = 560, 690
@@ -787,17 +787,19 @@ class DefectInspectorApp:
         map_canvas.pack(padx=6, pady=6)
 
         map_canvas.create_rectangle(MARGIN, MARGIN, MARGIN + plot_w, MARGIN + plot_h, outline="#888")
-        map_canvas.create_text(MARGIN, MARGIN + plot_h + 14, text=f"X:{X_RANGE[0]}", anchor="w",
+        # X축: 왼쪽이 1500, 오른쪽이 0 (X=1500이 좌측 상단에 오도록)
+        map_canvas.create_text(MARGIN, MARGIN + plot_h + 14, text=f"X:{X_RANGE[1]}", anchor="w",
                                 font=("맑은 고딕", 8))
-        map_canvas.create_text(MARGIN + plot_w, MARGIN + plot_h + 14, text=f"X:{X_RANGE[1]}", anchor="e",
+        map_canvas.create_text(MARGIN + plot_w, MARGIN + plot_h + 14, text=f"X:{X_RANGE[0]}", anchor="e",
                                 font=("맑은 고딕", 8))
+        # Y축: 위쪽이 1850, 아래쪽이 0
         map_canvas.create_text(MARGIN - 4, MARGIN, text=f"Y:{Y_RANGE[1]}", anchor="e", font=("맑은 고딕", 8))
         map_canvas.create_text(MARGIN - 4, MARGIN + plot_h, text=f"Y:{Y_RANGE[0]}", anchor="e",
                                 font=("맑은 고딕", 8))
 
         def to_canvas_xy(x, y):
-            cx = MARGIN + (x / X_RANGE[1]) * plot_w
-            # 좌하단이 (0,0)이 되도록 Y축을 반전 (y가 클수록 위로 올라감)
+            # 좌측 상단이 (X=1500, Y=1850)이 되도록 X축을 반전
+            cx = MARGIN + plot_w - (x / X_RANGE[1]) * plot_w
             cy = MARGIN + plot_h - (y / Y_RANGE[1]) * plot_h
             return cx, cy
 
@@ -855,29 +857,76 @@ class DefectInspectorApp:
                 ttk.Label(info, text=f"AI판정: {row.auto_label.get()}   신뢰율: {row.confidence.get()}%").pack(anchor="w")
                 ttk.Label(info, text=f"작업자 판정: {row.worker_label.get() or '-'}").pack(anchor="w")
 
-        def on_map_click(event):
-            closest = map_canvas.find_closest(event.x, event.y)
-            if not closest:
-                return
-            dot_id = closest[0]
-            row = dot_refs.get(dot_id)
-            if row is None:
-                return
-            coords = map_canvas.coords(dot_id)
-            if not coords:
-                return
-            ccx, ccy = (coords[0] + coords[2]) / 2, (coords[1] + coords[3]) / 2
-            if ((event.x - ccx) ** 2 + (event.y - ccy) ** 2) ** 0.5 > 10:
-                return
-            if row in map_selected_set:
+        def select_dot(dot_id, row, exclusive_toggle=True):
+            if exclusive_toggle and row in map_selected_set:
                 map_selected_set.remove(row)
                 map_canvas.itemconfig(dot_id, fill="#4a90d9", outline="#20406e")
             else:
                 map_selected_set.add(row)
                 map_canvas.itemconfig(dot_id, fill="#ff5a8c", outline="#a10047")
-            refresh_detail_panel()
 
-        map_canvas.bind("<Button-1>", on_map_click)
+        drag_state = {"start": None, "rect_id": None}
+        DRAG_THRESHOLD = 4  # 이 이상 움직이면 클릭이 아닌 드래그(영역 선택)로 처리
+
+        def on_map_press(event):
+            drag_state["start"] = (event.x, event.y)
+            if drag_state["rect_id"] is None:
+                drag_state["rect_id"] = map_canvas.create_rectangle(
+                    event.x, event.y, event.x, event.y,
+                    outline="#ff5a8c", dash=(4, 2))
+            else:
+                map_canvas.coords(drag_state["rect_id"], event.x, event.y, event.x, event.y)
+
+        def on_map_drag(event):
+            if drag_state["start"] is None or drag_state["rect_id"] is None:
+                return
+            sx, sy = drag_state["start"]
+            map_canvas.coords(drag_state["rect_id"], sx, sy, event.x, event.y)
+
+        def on_map_release(event):
+            if drag_state["start"] is None:
+                return
+            sx, sy = drag_state["start"]
+            dx, dy = abs(event.x - sx), abs(event.y - sy)
+
+            if drag_state["rect_id"] is not None:
+                map_canvas.delete(drag_state["rect_id"])
+                drag_state["rect_id"] = None
+
+            changed = False
+            if dx < DRAG_THRESHOLD and dy < DRAG_THRESHOLD:
+                # 단순 클릭: 가장 가까운 점 하나를 토글 선택
+                closest = map_canvas.find_closest(event.x, event.y)
+                if closest:
+                    dot_id = closest[0]
+                    row = dot_refs.get(dot_id)
+                    if row is not None:
+                        coords = map_canvas.coords(dot_id)
+                        if coords:
+                            ccx, ccy = (coords[0] + coords[2]) / 2, (coords[1] + coords[3]) / 2
+                            if ((event.x - ccx) ** 2 + (event.y - ccy) ** 2) ** 0.5 <= 10:
+                                select_dot(dot_id, row, exclusive_toggle=True)
+                                changed = True
+            else:
+                # 드래그: 사각형 영역 안의 모든 점을 선택에 추가
+                x0, x1 = sorted((sx, event.x))
+                y0, y1 = sorted((sy, event.y))
+                for dot_id, row in dot_refs.items():
+                    coords = map_canvas.coords(dot_id)
+                    if not coords:
+                        continue
+                    ccx, ccy = (coords[0] + coords[2]) / 2, (coords[1] + coords[3]) / 2
+                    if x0 <= ccx <= x1 and y0 <= ccy <= y1 and row not in map_selected_set:
+                        select_dot(dot_id, row, exclusive_toggle=False)
+                        changed = True
+
+            drag_state["start"] = None
+            if changed:
+                refresh_detail_panel()
+
+        map_canvas.bind("<ButtonPress-1>", on_map_press)
+        map_canvas.bind("<B1-Motion>", on_map_drag)
+        map_canvas.bind("<ButtonRelease-1>", on_map_release)
         refresh_detail_panel()
 
     # ------------------------------------------------------------------
