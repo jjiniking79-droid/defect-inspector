@@ -128,6 +128,7 @@ class DefectInspectorApp:
         self._build_ui()
         self._refresh_all_category_widgets()
         self._refresh_filter_options()
+        self._update_summary()
         self._update_status("준비 완료. 모델 학습 여부: " +
                              ("학습됨" if self.model.is_trained() else "미학습"))
 
@@ -276,6 +277,29 @@ class DefectInspectorApp:
         ttk.Button(f2, text="필터 적용", command=self.apply_filters).pack(side="left", padx=6)
         ttk.Button(f2, text="필터 초기화", command=self.reset_filters).pack(side="left", padx=2)
 
+        # ---------- 상단 툴바 5: 판정 결과 요약 (검사매수 / 총 불량수 / 유형별 카운트·DPU) ----------
+        toolbar5 = ttk.LabelFrame(self.root, text="판정 결과 요약 (현재 필터 기준)", padding=6)
+        toolbar5.pack(side="top", fill="x", padx=6, pady=(0, 4))
+
+        summary_top = ttk.Frame(toolbar5)
+        summary_top.pack(side="top", fill="x")
+        self.summary_inspected_var = tk.StringVar(value="검사매수 : 0 개  (GLS 중복제외)")
+        self.summary_total_defect_var = tk.StringVar(value="총 불량수 : 0 개")
+        ttk.Label(summary_top, textvariable=self.summary_inspected_var,
+                  font=("맑은 고딕", 10, "bold")).pack(side="left", padx=(0, 24))
+        ttk.Label(summary_top, textvariable=self.summary_total_defect_var,
+                  font=("맑은 고딕", 10, "bold")).pack(side="left")
+
+        self.summary_tree = ttk.Treeview(toolbar5, columns=("type", "count", "dpu"),
+                                          show="headings", height=4)
+        self.summary_tree.heading("type", text="유형")
+        self.summary_tree.heading("count", text="카운트")
+        self.summary_tree.heading("dpu", text="DPU")
+        self.summary_tree.column("type", width=160, anchor="center")
+        self.summary_tree.column("count", width=100, anchor="center")
+        self.summary_tree.column("dpu", width=100, anchor="center")
+        self.summary_tree.pack(side="top", fill="x", pady=(6, 0))
+
         # ---------- 안내: 신뢰율 음영 표시 ----------
         legend = ttk.Frame(self.root, padding=(10, 2))
         legend.pack(side="top", fill="x")
@@ -342,6 +366,7 @@ class DefectInspectorApp:
         data_store.save_categories(self.categories)
         self.new_cat_entry.delete(0, "end")
         self._refresh_all_category_widgets()
+        self._update_summary()
         self._update_status(f"'{name}' 유형이 추가되었습니다.")
 
     def delete_category(self):
@@ -365,6 +390,7 @@ class DefectInspectorApp:
             del self.rules[cat]
             data_store.save_rules(self.rules)
         self._refresh_all_category_widgets()
+        self._update_summary()
         self._update_status(f"'{cat}' 유형이 삭제되었습니다.")
 
     # ------------------------------------------------------------------
@@ -440,6 +466,7 @@ class DefectInspectorApp:
                     pass
         self.rows = []
         self._refresh_filter_options()
+        self._update_summary()
         self._update_status("목록을 비웠습니다.")
 
     # ------------------------------------------------------------------
@@ -474,6 +501,7 @@ class DefectInspectorApp:
         worker_combo = ttk.Combobox(self.table_frame, textvariable=row.worker_label,
                                      values=self.categories, width=16, state="readonly",
                                      style="Normal.TCombobox")
+        worker_combo.bind("<<ComboboxSelected>>", lambda e: self.apply_filters())
 
         row.widgets = {
             "chk": chk, "thumb": thumb_lbl, "lot": lot_lbl, "gls": gls_lbl,
@@ -568,8 +596,45 @@ class DefectInspectorApp:
             row.visible = ok
 
         self._relayout_visible_rows()
+        self._update_summary()
         shown = sum(1 for r in self.rows if r.visible)
         self._update_status(f"필터 적용됨: {shown} / {len(self.rows)} 장 표시 중")
+
+    def _update_summary(self):
+        """검사매수(GLS 중복제외) / 총 불량수 / 유형별 카운트·DPU 갱신 (현재 필터 기준)"""
+        visible_rows = [r for r in self.rows if r.visible]
+        gls_set = {r.gls for r in visible_rows if r.gls and r.gls != "-"}
+        inspected = len(gls_set)
+
+        counts = {}
+        for r in visible_rows:
+            label = r.worker_label.get().strip()
+            if not label:
+                auto = r.auto_label.get().strip()
+                if auto and auto not in ("-", "오류"):
+                    label = auto
+            if label:
+                counts[label] = counts.get(label, 0) + 1
+
+        total_defect = sum(counts.values())
+        self.summary_inspected_var.set(f"검사매수 : {inspected} 개  (GLS 중복제외)")
+        self.summary_total_defect_var.set(f"총 불량수 : {total_defect} 개")
+
+        for iid in self.summary_tree.get_children():
+            self.summary_tree.delete(iid)
+
+        def dpu_text(cnt):
+            if inspected <= 0:
+                return "-"
+            return f"{cnt / inspected:.2f}"
+
+        for cat in self.categories:
+            cnt = counts.get(cat, 0)
+            self.summary_tree.insert("", "end", values=(cat, f"{cnt}개", dpu_text(cnt)))
+        # 삭제된 유형이라도 현재 데이터에 남아있는 라벨이 있으면 함께 표시
+        for label, cnt in counts.items():
+            if label not in self.categories:
+                self.summary_tree.insert("", "end", values=(f"{label} (삭제된 유형)", f"{cnt}개", dpu_text(cnt)))
 
     def _relayout_visible_rows(self):
         r = 1  # 0행은 헤더
@@ -609,6 +674,7 @@ class DefectInspectorApp:
             return
         for r in checked:
             r.worker_label.set(cat)
+        self.apply_filters()
         self._update_status(f"선택된 {len(checked)}장에 '{cat}' 판정값을 적용했습니다.")
 
     # ------------------------------------------------------------------
