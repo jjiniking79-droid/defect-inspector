@@ -768,7 +768,7 @@ class DefectInspectorApp:
 
         popup = tk.Toplevel(self.root)
         popup.title(f"MAP - 선택 이미지 {len(selected)}개")
-        popup.geometry("1020x800")
+        popup.geometry("1150x760")
 
         main_frame = ttk.Frame(popup)
         main_frame.pack(fill="both", expand=True, padx=8, pady=8)
@@ -777,7 +777,7 @@ class DefectInspectorApp:
             main_frame, text="X-Y 좌표 맵 (점 클릭 또는 마우스 드래그로 영역 선택 - 여러 점 선택 가능)")
         map_frame.pack(side="left", fill="y", padx=(0, 8))
 
-        CANVAS_W, CANVAS_H = 560, 690
+        CANVAS_W, CANVAS_H = 690, 560
         MARGIN = 34
         plot_w = CANVAS_W - 2 * MARGIN
         plot_h = CANVAS_H - 2 * MARGIN
@@ -787,20 +787,21 @@ class DefectInspectorApp:
         map_canvas.pack(padx=6, pady=6)
 
         map_canvas.create_rectangle(MARGIN, MARGIN, MARGIN + plot_w, MARGIN + plot_h, outline="#888")
-        # X축: 왼쪽이 1500, 오른쪽이 0 (X=1500이 좌측 상단에 오도록)
-        map_canvas.create_text(MARGIN, MARGIN + plot_h + 14, text=f"X:{X_RANGE[1]}", anchor="w",
+        # X축(세로): 아래쪽이 0, 위쪽이 1500
+        map_canvas.create_text(MARGIN - 4, MARGIN, text=f"X:{X_RANGE[1]}", anchor="e", font=("맑은 고딕", 8))
+        map_canvas.create_text(MARGIN - 4, MARGIN + plot_h, text=f"X:{X_RANGE[0]}", anchor="e",
                                 font=("맑은 고딕", 8))
-        map_canvas.create_text(MARGIN + plot_w, MARGIN + plot_h + 14, text=f"X:{X_RANGE[0]}", anchor="e",
+        # Y축(가로): 왼쪽이 0, 오른쪽이 1850
+        map_canvas.create_text(MARGIN, MARGIN + plot_h + 14, text=f"Y:{Y_RANGE[0]}", anchor="w",
                                 font=("맑은 고딕", 8))
-        # Y축: 위쪽이 1850, 아래쪽이 0
-        map_canvas.create_text(MARGIN - 4, MARGIN, text=f"Y:{Y_RANGE[1]}", anchor="e", font=("맑은 고딕", 8))
-        map_canvas.create_text(MARGIN - 4, MARGIN + plot_h, text=f"Y:{Y_RANGE[0]}", anchor="e",
+        map_canvas.create_text(MARGIN + plot_w, MARGIN + plot_h + 14, text=f"Y:{Y_RANGE[1]}", anchor="e",
                                 font=("맑은 고딕", 8))
 
         def to_canvas_xy(x, y):
-            # 좌측 상단이 (X=1500, Y=1850)이 되도록 X축을 반전
-            cx = MARGIN + plot_w - (x / X_RANGE[1]) * plot_w
-            cy = MARGIN + plot_h - (y / Y_RANGE[1]) * plot_h
+            # 좌측 하단이 (X=0, Y=0), 좌측 상단이 X=1500 이 되도록
+            # X는 세로축(아래->위로 증가), Y는 가로축(왼쪽->오른쪽으로 증가)
+            cx = MARGIN + (y / Y_RANGE[1]) * plot_w
+            cy = MARGIN + plot_h - (x / X_RANGE[1]) * plot_h
             return cx, cy
 
         dot_refs = {}
