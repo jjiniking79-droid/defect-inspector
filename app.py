@@ -72,23 +72,31 @@ ALL_FILTER = "전체"
 
 def parse_filename(path):
     """
-    파일명 규칙: LOT_GLS_..._..._..._X_Y_..._...
-    예) 64N68001AQ0_64N67002720_64N6700272UC4_TPTN2603_1011_21.829_1203.322_F1II_01
-        parts[0]=LOT, parts[1]=GLS, parts[5]=X, parts[6]=Y
+    파일명 규칙 (신규):
+    LOT_LOT중복_GLS_..._..._..._X_Y_..._...
+    예) 6H368001AM0_6H368001AM0_6H366000840_6H336600084DEE_TPTN2603_1011_1145.716_1403.284_F15_01.JPG.JPG
+        parts[0]=LOT, parts[2]=GLS, parts[6]=X, parts[7]=Y
+    X, Y는 소수점을 버리고 정수부만 사용합니다.
     규칙에 맞지 않는 파일명은 LOT/GLS는 "-", X/Y는 None 으로 처리됩니다.
     """
     base = os.path.splitext(os.path.basename(path))[0]
     parts = base.split("_")
     lot = parts[0] if len(parts) > 0 and parts[0] else "-"
-    gls = parts[1] if len(parts) > 1 and parts[1] else "-"
+    gls = parts[2] if len(parts) > 2 and parts[2] else "-"
     x = y = None
-    if len(parts) > 6:
-        try:
-            x = float(parts[5])
-            y = float(parts[6])
-        except ValueError:
-            x = y = None
+    if len(parts) > 7:
+        x = _int_part(parts[6])
+        y = _int_part(parts[7])
     return lot, gls, x, y
+
+
+def _int_part(text):
+    """'1145.716' -> 1145  (소수점 버리고 정수부만, 부호 없는 좌표값 기준)"""
+    try:
+        int_str = text.split(".")[0]
+        return int(int_str)
+    except (ValueError, AttributeError):
+        return None
 
 
 def _safe_float(text, default):
@@ -291,7 +299,7 @@ class DefectInspectorApp:
                   font=("맑은 고딕", 10, "bold")).pack(side="left")
 
         self.summary_tree = ttk.Treeview(toolbar5, columns=("type", "count", "dpu"),
-                                          show="headings", height=4)
+                                          show="headings", height=8)
         self.summary_tree.heading("type", text="유형")
         self.summary_tree.heading("count", text="카운트")
         self.summary_tree.heading("dpu", text="DPU")
@@ -300,12 +308,17 @@ class DefectInspectorApp:
         self.summary_tree.column("dpu", width=100, anchor="center")
         self.summary_tree.pack(side="top", fill="x", pady=(6, 0))
 
-        # ---------- 안내: 신뢰율 음영 표시 ----------
+        # ---------- 안내: 신뢰율 음영 표시 (기준값 직접 입력 가능) ----------
         legend = ttk.Frame(self.root, padding=(10, 2))
         legend.pack(side="top", fill="x")
         swatch = tk.Label(legend, text="   ", bg=ROW_BG_LOWCONF, relief="solid", borderwidth=1)
         swatch.pack(side="left", padx=(0, 4))
-        ttk.Label(legend, text=f"= AI 신뢰율 {LOW_CONF_THRESHOLD:.0f}% 미만 (재검수 권장)").pack(side="left")
+        ttk.Label(legend, text="= AI 신뢰율 기준(%):").pack(side="left")
+        self.low_conf_var = tk.StringVar(value=str(int(LOW_CONF_THRESHOLD)))
+        threshold_entry = ttk.Entry(legend, textvariable=self.low_conf_var, width=5)
+        threshold_entry.pack(side="left", padx=(2, 2))
+        ttk.Label(legend, text="% 미만이면 재검수 권장 음영 표시").pack(side="left", padx=(0, 6))
+        ttk.Button(legend, text="기준 적용", command=self.apply_lowconf_threshold).pack(side="left")
 
         # ---------- 스크롤 가능한 표 영역 (헤더 + 데이터 행이 같은 grid 부모를 공유) ----------
         list_container = ttk.Frame(self.root)
@@ -339,6 +352,19 @@ class DefectInspectorApp:
 
     def _update_status(self, text):
         self.status_var.set(text)
+
+    def _get_low_conf_threshold(self):
+        return _safe_float(self.low_conf_var.get(), LOW_CONF_THRESHOLD)
+
+    def apply_lowconf_threshold(self):
+        threshold = self._get_low_conf_threshold()
+        applied = 0
+        for row in self.rows:
+            conf_val = _safe_float(row.confidence.get(), None)
+            if conf_val is not None:
+                self._set_row_bg(row, low_conf=conf_val < threshold)
+                applied += 1
+        self._update_status(f"신뢰율 기준 {threshold:.0f}%를 적용했습니다. ({applied}장 갱신)")
 
     # ------------------------------------------------------------------
     # 카테고리 관리
@@ -490,8 +516,8 @@ class DefectInspectorApp:
 
         lot_lbl = tk.Label(self.table_frame, text=row.lot, bg=bg, anchor="center")
         gls_lbl = tk.Label(self.table_frame, text=row.gls, bg=bg, anchor="center")
-        x_text = f"{row.x:.0f}" if row.x is not None else "-"
-        y_text = f"{row.y:.0f}" if row.y is not None else "-"
+        x_text = str(row.x) if row.x is not None else "-"
+        y_text = str(row.y) if row.y is not None else "-"
         x_lbl = tk.Label(self.table_frame, text=x_text, bg=bg, anchor="center")
         y_lbl = tk.Label(self.table_frame, text=y_text, bg=bg, anchor="center")
 
@@ -632,9 +658,14 @@ class DefectInspectorApp:
             cnt = counts.get(cat, 0)
             self.summary_tree.insert("", "end", values=(cat, f"{cnt}개", dpu_text(cnt)))
         # 삭제된 유형이라도 현재 데이터에 남아있는 라벨이 있으면 함께 표시
-        for label, cnt in counts.items():
-            if label not in self.categories:
-                self.summary_tree.insert("", "end", values=(f"{label} (삭제된 유형)", f"{cnt}개", dpu_text(cnt)))
+        extra_labels = [l for l in counts if l not in self.categories]
+        for label in extra_labels:
+            cnt = counts[label]
+            self.summary_tree.insert("", "end", values=(f"{label} (삭제된 유형)", f"{cnt}개", dpu_text(cnt)))
+
+        # 유형이 많아져도 스크롤 없이 한 화면에 보이도록 표 높이를 자동 조절 (최소 6, 최대 14)
+        total_rows = len(self.categories) + len(extra_labels)
+        self.summary_tree.configure(height=max(6, min(total_rows, 14)))
 
     def _relayout_visible_rows(self):
         r = 1  # 0행은 헤더
@@ -686,7 +717,7 @@ class DefectInspectorApp:
 
         if not session_labeled:
             dataset = data_store.load_dataset()
-            if len(dataset) < 2:
+            if len(dataset) < 1:
                 messagebox.showwarning(
                     "알림",
                     "학습할 데이터가 없습니다.\n"
@@ -708,13 +739,9 @@ class DefectInspectorApp:
                 merged[path] = label
             combined = list(merged.items())
 
-        if len(set(l for _, l in combined)) < 2:
-            messagebox.showwarning("알림", "학습을 위해서는 서로 다른 판정 유형이 최소 2종류 이상 필요합니다.")
-            return
-
         self._set_controls_enabled(False)
         self.progress.configure(mode="determinate", maximum=len(combined), value=0)
-        self._update_status(f"AI 학습 중... (총 {len(combined)}장)")
+        self._update_status(f"AI 학습 중... (총 {len(combined)}장, 데이터 증강 적용)")
 
         def worker():
             try:
@@ -805,7 +832,7 @@ class DefectInspectorApp:
                     row.auto_label.set(label if label else "-")
                     conf_pct = conf * 100 if label else 0.0
                     row.confidence.set(f"{conf_pct:.1f}" if label else "-")
-                    self._set_row_bg(row, low_conf=bool(label) and conf_pct < LOW_CONF_THRESHOLD)
+                    self._set_row_bg(row, low_conf=bool(label) and conf_pct < self._get_low_conf_threshold())
                     self.progress.configure(value=i)
                     self._update_status(f"자동 판정 중... {i}/{total}")
                 elif msg[0] == "predict_done":
@@ -917,7 +944,7 @@ class DefectInspectorApp:
                     ttk.Label(item, text="[이미지 로드 실패]").pack(side="left", padx=(0, 10))
                 info = ttk.Frame(item)
                 info.pack(side="left", anchor="n")
-                ttk.Label(info, text=f"X: {row.x:.0f}   Y: {row.y:.0f}",
+                ttk.Label(info, text=f"X: {row.x}   Y: {row.y}",
                           font=("맑은 고딕", 10, "bold")).pack(anchor="w")
                 ttk.Label(info, text=f"LOT: {row.lot}").pack(anchor="w")
                 ttk.Label(info, text=f"GLS: {row.gls}").pack(anchor="w")
