@@ -3,9 +3,9 @@
 불량 이미지 자동 판정 프로그램 (Defect Inspector)
 ------------------------------------------------
 - 이미지 폴더/파일 불러오기 (모든 이미지 형식)
-- 파일명에서 LOT / GLS / X / Y 좌표 자동 파싱
-    예) 64N68001AQ0_64N67002720_64N6700272UC4_TPTN2603_1011_21.829_1203.322_F1II_01.jpg
-        -> LOT=64N68001AQ0, GLS=64N67002720, X=21.829, Y=1203.322
+- 파일명에서 LOT / GLS / X / Y 좌표 자동 파싱 (X 앞 언더바 개수가 달라도 자동 인식)
+    예) 6H368001AM0_6H368001AM0_6H366000840_..._1011_1145.716_1403.284_F15_01.JPG.JPG
+        -> LOT=6H368001AM0, GLS=6H366000840, X=1145, Y=1403
 - 불량 유형 정의 텍스트 입력/저장 (작성자가 직접 정의, 참고 문서로 저장됨)
 - 판정 유형(카테고리) 추가/삭제 관리
 - 표 컬럼: 선택 / 이미지 / LOT / GLS / X / Y / AI판정 / 신뢰율(%) / 작업자 판정
@@ -72,10 +72,17 @@ ALL_FILTER = "전체"
 
 def parse_filename(path):
     """
-    파일명 규칙 (신규):
+    파일명 규칙:
     LOT_LOT중복_GLS_..._..._..._X_Y_..._...
-    예) 6H368001AM0_6H368001AM0_6H366000840_6H336600084DEE_TPTN2603_1011_1145.716_1403.284_F15_01.JPG.JPG
-        parts[0]=LOT, parts[2]=GLS, parts[6]=X, parts[7]=Y
+    (X 앞의 언더바(_) 개수가 1개일 수도, 2개일 수도 있어 자리 번호가 밀릴 수 있으므로
+     '.'이 포함된(소수점이 있는) 연속된 두 항목을 찾아 X, Y로 판단합니다.)
+
+    예1) 6H368001AM0_6H368001AM0_6H366000840_..._1011_1145.716_1403.284_F15_01.JPG.JPG
+         -> LOT=6H368001AM0, GLS=6H366000840, X=1145, Y=1403
+    예2) 6AD68001AG0_6AD68001AG0_6AD67000220_..._1011__1140.082_1077.636_F18.JPG.JPG
+         (X 앞 언더바 2개) -> LOT=6AD68001AG0, GLS=6AD67000220, X=1140, Y=1077
+
+    LOT=parts[0], GLS=parts[2] 는 고정.
     X, Y는 소수점을 버리고 정수부만 사용합니다.
     규칙에 맞지 않는 파일명은 LOT/GLS는 "-", X/Y는 None 으로 처리됩니다.
     """
@@ -84,9 +91,14 @@ def parse_filename(path):
     lot = parts[0] if len(parts) > 0 and parts[0] else "-"
     gls = parts[2] if len(parts) > 2 and parts[2] else "-"
     x = y = None
-    if len(parts) > 7:
-        x = _int_part(parts[6])
-        y = _int_part(parts[7])
+    # LOT/GLS 이후 구간에서 소수점을 포함한 연속된 두 항목을 X, Y로 판단
+    for i in range(3, len(parts) - 1):
+        a, b = parts[i], parts[i + 1]
+        if a and b and "." in a and "." in b:
+            xi, yi = _int_part(a), _int_part(b)
+            if xi is not None and yi is not None:
+                x, y = xi, yi
+                break
     return lot, gls, x, y
 
 
